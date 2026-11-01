@@ -151,7 +151,7 @@ ATW_SPACE_HEAT_DEMAND_BIT = 0x01
 ATW_GALMET_ZONE1_SETPOINT_INDEX = 6
 
 
-def _is_27_byte_atw_status(body: bytearray | bytes) -> bool:
+def is_27_byte_atw_status(body: bytearray | bytes) -> bool:
     """Return whether ``body`` has the hardware-validated 27-byte ATW layout.
 
     Galmet (#38) and NØRDIS (#132) units share this layout but differ at
@@ -159,6 +159,103 @@ def _is_27_byte_atw_status(body: bytearray | bytes) -> bool:
     captured 25-byte 171H120F frame has 0x90/0x50/0x68 at byte[3] instead.
     """
     return len(body) == 27 and body[0] == 0x01 and body[3:6] == b"\xa0\x03\x03"
+
+
+# 27-byte ATW write path (#42). The 27-byte status is the Midea C3 *base* status
+# (midea-local's C3 layout with one extra flags byte at [3]): [1] power/option
+# flags, [4] C3 mode (1 auto, 2 cool, 3 heat), [6]/[7] Zone-1/2 targets, [8] DHW
+# target, [9] room target x2, [10]/[11] Zone-1 heat max/min, [20]/[21] DHW
+# max/min. The matching base SET body is
+#   01, power, mode, zone1, zone2, dhw, room x2, options
+# and every byte except the requested change is echoed from the live status.
+# Hardware-validated on a NØRDIS unit: a DHW 60 -> 59 -> 60 round trip changed
+# only byte[8], and the device answered each SET with its new status frame.
+ATW27_C3_MODE_INDEX = 4
+ATW27_ZONE2_SETPOINT_INDEX = 7
+ATW27_ROOM_SETPOINT_X2_INDEX = 9
+ATW27_ZONE1_HEAT_MAX_INDEX = 10
+ATW27_ZONE1_HEAT_MIN_INDEX = 11
+ATW27_DHW_MAX_INDEX = 20
+ATW27_DHW_MIN_INDEX = 21
+ATW27_C3_MODE_HEAT = 3
+ATW27_ZONE1_POWER = 0x01
+ATW27_ZONE2_POWER = 0x02
+ATW27_DHW_POWER = 0x04
+ATW27_POWER_MASK = ATW27_ZONE1_POWER | ATW27_ZONE2_POWER | ATW27_DHW_POWER
+
+
+def atw27_zone1_limits(body: bytearray | bytes) -> tuple[int, int]:
+    """Return the unit's own Zone-1 heating (min, max) from a 27-byte status."""
+    return body[ATW27_ZONE1_HEAT_MIN_INDEX], body[ATW27_ZONE1_HEAT_MAX_INDEX]
+
+
+def atw27_dhw_limits(body: bytearray | bytes) -> tuple[int, int]:
+    """Return the unit's own DHW (min, max) from a 27-byte status."""
+    return body[ATW27_DHW_MIN_INDEX], body[ATW27_DHW_MAX_INDEX]
+
+
+def atw27_dhw_power(body: bytearray | bytes) -> bool:
+    """Return whether DHW is enabled in a 27-byte status."""
+    return bool(body[ATW_FLAGS_INDEX] & ATW27_DHW_POWER)
+
+
+def _atw27_checked(value: int, limits: tuple[int, int], name: str) -> int:
+    low, high = limits
+    if not low <= value <= high:
+        raise ValueError(f"{name} {value}C out of range (allowed: {low}-{high}C)")
+    return value
+
+
+def build_atw27_set(
+    status_body: bytearray | bytes,
+    *,
+    zone1_power: bool | None = None,
+    zone1_heat: bool = False,
+    zone1_target: int | None = None,
+    dhw_power: bool | None = None,
+    dhw_target: int | None = None,
+) -> str:
+    """Build a C3 base SET frame from a 27-byte ATW status.
+
+    Only the requested fields change; ``zone1_heat`` also forces the C3 mode
+    byte to Heat.
+    """
+    if not is_27_byte_atw_status(status_body):
+        raise ValueError("Not a 27-byte ATW status frame")
+    flags = status_body[ATW_FLAGS_INDEX]
+    power = flags & ATW27_POWER_MASK
+    if zone1_power is not None:
+        power = power | ATW27_ZONE1_POWER if zone1_power else power & ~ATW27_ZONE1_POWER
+    if dhw_power is not None:
+        power = power | ATW27_DHW_POWER if dhw_power else power & ~ATW27_DHW_POWER
+    mode = ATW27_C3_MODE_HEAT if zone1_heat else status_body[ATW27_C3_MODE_INDEX]
+    zone1 = (
+        status_body[ATW_GALMET_ZONE1_SETPOINT_INDEX]
+        if zone1_target is None
+        else _atw27_checked(zone1_target, atw27_zone1_limits(status_body), "Zone-1 target")
+    )
+    dhw = (
+        status_body[ATW_DHW_SETPOINT_INDEX]
+        if dhw_target is None
+        else _atw27_checked(dhw_target, atw27_dhw_limits(status_body), "DHW target")
+    )
+    # Status option bits 0x08/0x10/0x20/0x40 (Zone-1 curve, Zone-2 curve,
+    # disinfect, fast DHW) are SET option bits 0x01/0x02/0x04/0x08.
+    options = (flags >> 3) & 0x0F
+    body = [
+        0x01,
+        power,
+        mode,
+        zone1,
+        status_body[ATW27_ZONE2_SETPOINT_INDEX],
+        dhw,
+        status_body[ATW27_ROOM_SETPOINT_X2_INDEX],
+        options,
+    ]
+    frame = [0xAA, 0x00, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, *body]
+    frame[1] = len(frame)
+    frame.append((~sum(frame[1:]) + 1) & 0xFF)
+    return bytes(frame).hex()
 
 
 def decode_atw_status(body: bytearray | bytes) -> ITSStatus:
@@ -182,7 +279,7 @@ def decode_atw_status(body: bytearray | bytes) -> ITSStatus:
     status.status_flags_raw = flags
     # The bit's exact semantics depend on the frame layout; see module notes.
     status.pump_system = bool(flags & ATW_SPACE_HEAT_DEMAND_BIT)
-    is_27_byte = _is_27_byte_atw_status(body)
+    is_27_byte = is_27_byte_atw_status(body)
     if is_27_byte:
         # Three controlled hardware states establish bit 0 as Zone-1 power for
         # this layout: set for both active and idle Heating, clear when Off.

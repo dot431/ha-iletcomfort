@@ -304,3 +304,24 @@ def test_kjrh120l_hvac_mode_heat_from_on_frame():
     entity = _climate(KJRH120L_SN8, ITSSensors(), status)
     assert entity.hvac_mode != HVACMode.OFF
     assert entity.hvac_mode == HVACMode.HEAT
+
+
+NORDIS_STATUS = bytes.fromhex(
+    "01 0d 17 a0 03 03 23 1e 3c 30 37 19 19 05 37 19 19 05 3c 22 3c 14 32 00 40 05 00"
+)
+
+
+def test_atw_climate_offers_heat_and_off_only():
+    entity = _climate(ATW_SN8, ITSSensors(), decode_atw_status(NORDIS_STATUS))
+
+    assert entity.hvac_modes == [HVACMode.OFF, HVACMode.HEAT]
+
+
+async def test_atw27_climate_uses_unit_zone1_limits_and_writes_zone1():
+    entity = _climate(ATW_SN8, ITSSensors(), decode_atw_status(NORDIS_STATUS))
+
+    assert (entity.min_temp, entity.max_temp) == (25.0, 55.0)
+    assert entity.target_temperature == 35.0
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 60})
+
+    entity.coordinator.async_set_device.assert_awaited_once_with(temperature=55)

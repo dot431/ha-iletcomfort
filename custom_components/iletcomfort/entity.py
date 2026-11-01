@@ -6,6 +6,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import DOMAIN
 from .coordinator import ILetComfortCoordinator
+from .model_profiles import ModelProfile, is_27_byte_atw_status, resolve_profile
 
 
 def build_device_info(coordinator: ILetComfortCoordinator) -> DeviceInfo:
@@ -25,3 +26,13 @@ def build_device_info(coordinator: ILetComfortCoordinator) -> DeviceInfo:
         model=coordinator.sn8,
         sw_version=sw_version,
     )
+
+
+def atw27_status_body(coordinator: ILetComfortCoordinator) -> bytes | None:
+    """Return the raw status body when the device reports the 27-byte ATW layout."""
+    if resolve_profile(coordinator.sn8) is not ModelProfile.ATW:
+        return None
+    status = (coordinator.data or {}).get("status")
+    if status is None or not is_27_byte_atw_status(status.raw_body):
+        return None
+    return status.raw_body

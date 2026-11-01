@@ -31,7 +31,9 @@ from .model_profiles import (
     KJRH120L_TEMP_MAX,
     KJRH120L_TEMP_MIN,
     ModelProfile,
+    atw27_zone1_limits,
     atw_sensors_are_placeholder,
+    is_27_byte_atw_status,
     kjrh120l_has_zone1,
     resolve_profile,
 )
@@ -99,6 +101,23 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
         if self._status is None:
             return HVACMode.OFF
         return _QUERY_MODE_TO_HVAC.get(self._status.mode, HVACMode.OFF)
+
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        # ATW decodes and writes only Zone-1 heat/off; cool is unvalidated.
+        if self._profile is ModelProfile.ATW:
+            return [HVACMode.OFF, HVACMode.HEAT]
+        return self._attr_hvac_modes
+
+    @property
+    def _atw27_body(self) -> bytes | None:
+        if (
+            self._profile is ModelProfile.ATW
+            and self._status is not None
+            and is_27_byte_atw_status(self._status.raw_body)
+        ):
+            return self._status.raw_body
+        return None
 
     @property
     def _profile(self) -> ModelProfile:
@@ -183,6 +202,8 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
         # above the air-side HEAT range (issue #35).
         if self._profile is ModelProfile.KJRH120L:
             return float(KJRH120L_TEMP_MIN)
+        if self._atw27_body is not None:
+            return float(atw27_zone1_limits(self._atw27_body)[0])
         set_mode = _HVAC_TO_SET_MODE.get(self.hvac_mode)
         if set_mode is not None and set_mode in TEMP_RANGES:
             return float(TEMP_RANGES[set_mode][0])
@@ -192,6 +213,8 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
     def max_temp(self) -> float:
         if self._profile is ModelProfile.KJRH120L:
             return float(KJRH120L_TEMP_MAX)
+        if self._atw27_body is not None:
+            return float(atw27_zone1_limits(self._atw27_body)[1])
         set_mode = _HVAC_TO_SET_MODE.get(self.hvac_mode)
         if set_mode is not None and set_mode in TEMP_RANGES:
             return float(TEMP_RANGES[set_mode][1])

@@ -144,6 +144,18 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
   when Zone-1 is off. Decode that as Heat/Off only for this structural variant. The active and stopped
   frames were otherwise identical, so compressor running state and frequency are unavailable—never
   infer them from this bit or report false/0.
+- **27-byte writes (#42) — hardware-validated on NØRDIS.** The 27-byte status is the Midea C3 *base*
+  status, i.e. `midea-local`'s C3 layout with one extra flags byte at `body[3]`: `[1]` power/option
+  flags (0x01 Zone-1, 0x02 Zone-2, 0x04 DHW, 0x08/0x10 curves, 0x20 disinfect, 0x40 fast DHW), `[4]`
+  C3 mode (1 auto, 2 cool, 3 heat), `[6]`/`[7]` Zone-1/2 targets, `[8]` DHW, `[9]` room ×2, `[10]`/`[11]`
+  Zone-1 heat max/min, `[20]`/`[21]` DHW max/min. Writes use the matching base SET
+  (`build_atw27_set`): `aa 12 c3 00×5 00 02 | 01 power mode z1 z2 dhw room×2 options | cs`, echoing
+  every field except the change; the status option bits shift right by 3 into the SET options byte.
+  Zone-1 35→36→35 and DHW 60→59→60 each changed only the target byte, and the device answers a SET with
+  its new status. The legacy 62-byte `build_c3_set` must never reach this layout: read as a C3 base SET
+  it clears DHW power, sets mode Auto and writes target+35 into Zone-1. Note the layout signature
+  includes `body[4:6]` (mode), so a unit switched to Cool/Auto in the app is not detected and writes
+  fall back to the refusal guard; widen it only with captures in those modes.
 
 ### KJRH-120L dual variant (`sn8 17100003`, #5) — hardware-validated reads
 - The same `sn8` covers pure-DHW and Zone-1 + DHW controllers. Gate the dual layout only when status

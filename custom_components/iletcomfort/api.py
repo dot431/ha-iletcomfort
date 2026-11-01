@@ -823,21 +823,26 @@ class ILetComfortClient:
         mute_level: int | None = None,
         power_on: bool = False,
         last_on_state: tuple[int, int] | None = None,
+        dhw_temperature: int | None = None,
+        dhw_power: bool | None = None,
     ) -> dict[str, Any]:
         """Send a SET command to the heat pump.
 
         ``sn8`` selects the write encoding per model. The KJRH-120L (sn8
         17100003) rejects the standard 62-byte C3 SET frame, so for that profile
         a captured short write command (``00 <field> 01 <value> ff``) is sent
-        directly. Every other (unknown/None/ATW/AQUAPURA) sn8 keeps the legacy
-        build_c3_set path unchanged: query current status for echo bytes, merge
-        the requested changes, validate temperature ranges, build and send the
-        SET frame.
+        directly. An ATW unit reporting the 27-byte status layout gets the C3
+        base SET built by ``build_atw27_set`` (``temperature`` is Zone 1;
+        ``dhw_temperature``/``dhw_power`` are only valid there). Every other
+        sn8/layout keeps the legacy build_c3_set path unchanged: query current
+        status for echo bytes, merge the requested changes, validate temperature
+        ranges, build and send the SET frame.
         """
         # Imported lazily to avoid a circular import (model_profiles imports api).
-        from .model_profiles import ModelProfile, resolve_profile
+        from .model_profiles import ModelProfile, is_27_byte_atw_status, resolve_profile
 
-        if resolve_profile(sn8) is ModelProfile.KJRH120L:
+        profile = resolve_profile(sn8)
+        if profile is ModelProfile.KJRH120L:
             return self._set_device_kjrh120l(
                 appliance_code,
                 mode=mode,
@@ -851,6 +856,23 @@ class ILetComfortClient:
         _LOGGER.debug("set_device status raw response: %s", response_hex)
         raw = parse_hex_response(response_hex)
         _body_type, status_body = extract_c3_body(raw)
+        if profile is ModelProfile.ATW and is_27_byte_atw_status(status_body):
+            if boost is not None or mute is not None or mute_level is not None:
+                raise ApiError(
+                    "Boost and silent mode writes are not validated for the "
+                    "27-byte ATW layout"
+                )
+            return self._set_device_atw27(
+                appliance_code,
+                status_body,
+                mode=mode,
+                temperature=temperature,
+                dhw_temperature=dhw_temperature,
+                dhw_power=dhw_power,
+                power_on=power_on,
+            )
+        if dhw_temperature is not None or dhw_power is not None:
+            raise ApiError("DHW writes are only supported on the 27-byte ATW layout")
         status = decode_its_status(status_body)
 
         # An unknown mode can mean this model uses a different status layout.
@@ -927,6 +949,44 @@ class ILetComfortClient:
             "effective_mode": eff_mode,
             "effective_temp": eff_temp,
         }
+
+    def _set_device_atw27(
+        self,
+        appliance_code: str,
+        status_body: bytearray,
+        *,
+        mode: int | None,
+        temperature: int | None,
+        dhw_temperature: int | None,
+        dhw_power: bool | None,
+        power_on: bool,
+    ) -> dict[str, Any]:
+        """Send a C3 base SET for the 27-byte ATW layout (#42).
+
+        HVAC heat/off and turn-on map to Zone-1 power; ``temperature`` is the
+        Zone-1 target. Fields not requested are echoed from ``status_body``.
+        """
+        # Imported lazily to avoid a circular import (model_profiles imports api).
+        from .model_profiles import build_atw27_set
+
+        if mode not in (None, MODE_OFF, MODE_HEAT):
+            raise ApiError(f"Mode {mode} is not supported on the 27-byte ATW layout")
+        zone1_power = None
+        if mode == MODE_OFF:
+            zone1_power = False
+        elif mode == MODE_HEAT or power_on:
+            zone1_power = True
+
+        command = build_atw27_set(
+            status_body,
+            zone1_power=zone1_power,
+            zone1_heat=mode == MODE_HEAT,
+            zone1_target=temperature,
+            dhw_power=dhw_power,
+            dhw_target=dhw_temperature,
+        )
+        response_hex = self.send_hex_command(appliance_code, command)
+        return {"sent": command, "response": response_hex}
 
     def _set_device_kjrh120l(
         self,

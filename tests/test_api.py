@@ -403,6 +403,96 @@ def test_set_device_atw_uses_build_c3_set_frame():
     assert len(sent[1]) == 124  # 62-byte C3 SET frame, unchanged
 
 
+# --- 27-byte ATW SET path (#42) ----------------------------------------------
+# NØRDIS status while heating Zone 1 at 35 C on the weather curve, DHW on at
+# 60 C. The SET echoes every field except the requested change.
+ATW_SN8 = "171H120F"
+NORDIS_STATUS = bytes.fromhex(
+    "01 0d 17 a0 03 03 23 1e 3c 30 37 19 19 05 37 19 19 05 3c 22 3c 14 32 00 40 05 00"
+)
+
+
+def _send_atw27(**changes) -> list[str]:
+    client = _make_client()
+    sent: list[str] = []
+
+    def _fake_send(_code, command):
+        sent.append(command)
+        return _c3_frame(NORDIS_STATUS)
+
+    with patch.object(client, "send_hex_command", side_effect=_fake_send):
+        client.set_device("APPL1", sn8=ATW_SN8, **changes)
+    assert sent[0] == build_c3_query(0x01)
+    return sent
+
+
+def test_set_device_atw27_dhw_setpoint_matches_hardware_validated_frame():
+    """The exact frame that moved a live NØRDIS DHW setpoint 60 -> 59 only."""
+    sent = _send_atw27(dhw_temperature=59)
+
+    assert sent[1:] == ["aa12c300000000000002010503231e3b300173"]
+
+
+@pytest.mark.parametrize(
+    ("changes", "body"),
+    [
+        ({"temperature": 40}, "010503281e3c3001"),
+        ({"mode": MODE_OFF}, "010403231e3c3001"),
+        ({"power_on": True}, "010503231e3c3001"),
+        ({"dhw_power": False}, "010103231e3c3001"),
+    ],
+)
+def test_set_device_atw27_changes_only_requested_field(changes, body):
+    sent = _send_atw27(**changes)
+
+    assert sent[1][20:-2] == body
+
+
+def test_set_device_atw27_heat_restores_zone1_power():
+    zone1_off = bytearray(NORDIS_STATUS)
+    zone1_off[1] = 0x0C
+    client = _make_client()
+    with patch.object(
+        client, "send_hex_command", return_value=_c3_frame(bytes(zone1_off))
+    ) as send:
+        client.set_device("APPL1", sn8=ATW_SN8, mode=MODE_HEAT)
+
+    assert send.call_args.args[1][20:-2] == "010503231e3c3001"
+
+
+@pytest.mark.parametrize(
+    "changes", [{"temperature": 56}, {"temperature": 24}, {"dhw_temperature": 61}]
+)
+def test_set_device_atw27_rejects_out_of_range_targets(changes):
+    client = _make_client()
+    with patch.object(
+        client, "send_hex_command", return_value=_c3_frame(NORDIS_STATUS)
+    ) as send:
+        with pytest.raises(ValueError, match="out of range"):
+            client.set_device("APPL1", sn8=ATW_SN8, **changes)
+    assert send.call_count == 1
+
+
+@pytest.mark.parametrize("changes", [{"boost": False}, {"mute": 1}, {"mode": 2}])
+def test_set_device_atw27_refuses_unvalidated_writes(changes):
+    client = _make_client()
+    with patch.object(
+        client, "send_hex_command", return_value=_c3_frame(NORDIS_STATUS)
+    ) as send:
+        with pytest.raises(ApiError):
+            client.set_device("APPL1", sn8=ATW_SN8, **changes)
+    assert send.call_count == 1
+
+
+def test_set_device_dhw_write_refused_outside_27_byte_layout():
+    client = _make_client()
+    body = bytes([0x01, 0x00, 0x01]) + bytes(17)
+    with patch.object(client, "send_hex_command", return_value=_c3_frame(body)) as send:
+        with pytest.raises(ApiError, match="27-byte ATW"):
+            client.set_device("APPL1", sn8=ATW_SN8, dhw_temperature=50)
+    assert send.call_count == 1
+
+
 def test_status_flag_zero_and_no_frequency_keeps_compressor_off():
     """A genuinely idle unit (flag 0, comp_frq 0) must not report running."""
     client = _make_client()
